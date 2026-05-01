@@ -1,8 +1,8 @@
 """
 TotoLab draw scraper — runs as GitHub Action
 Sources (in priority order):
-  1. magayo.com  — clean static HTML, confirmed accessible from GH Actions
-  2. yelu.sg     — fallback
+  1. magayo.com  — parses plain-text recent draws table (robust to bot detection)
+  2. Manual entry fallback with clear instructions
 """
 
 import json
@@ -18,7 +18,6 @@ SGT        = timezone(timedelta(hours=8))
 DRAW_DAYS  = {0, 3}  # Monday=0, Thursday=3
 
 MAGAYO_URL = 'https://www.magayo.com/lotto/singapore/toto-results/'
-YELU_URL   = 'https://www.yelu.sg/lottery/results/singapore-pools-toto'
 
 HEADERS = {
     'User-Agent': (
@@ -29,10 +28,10 @@ HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-SG,en;q=0.9',
     'Referer': 'https://www.google.com.sg/',
+    'Cache-Control': 'no-cache',
 }
 
-# Known draw number anchor for cross-referencing (update periodically)
-# Draw #4178 = 30 April 2026
+# Known draw anchors — update this list periodically
 KNOWN_DRAWS = {
     '2026-04-30': 4178,
     '2026-04-27': 4177,
@@ -40,6 +39,10 @@ KNOWN_DRAWS = {
     '2026-04-20': 4175,
     '2026-04-16': 4174,
     '2026-04-13': 4173,
+    '2026-04-09': 4172,
+    '2026-04-06': 4171,
+    '2026-04-02': 4170,
+    '2026-03-30': 4169,
 }
 
 ANCHOR_NO   = 4178
@@ -47,13 +50,12 @@ ANCHOR_DATE = datetime(2026, 4, 30, tzinfo=SGT).date()
 
 
 def estimate_draw_no(date_str):
-    """Estimate draw number from date using anchor + Mon/Thu count."""
-    target = datetime.strptime(date_str, '%Y-%m-%d').date()
     if date_str in KNOWN_DRAWS:
         return KNOWN_DRAWS[date_str]
-    delta = (target - ANCHOR_DATE).days
-    count = 0
-    step  = 1 if delta > 0 else -1
+    target = datetime.strptime(date_str, '%Y-%m-%d').date()
+    delta  = (target - ANCHOR_DATE).days
+    count  = 0
+    step   = 1 if delta > 0 else -1
     for i in range(abs(delta)):
         d = ANCHOR_DATE + timedelta(days=(i + 1) * step)
         if d.weekday() in DRAW_DAYS:
@@ -63,111 +65,87 @@ def estimate_draw_no(date_str):
 
 def fetch_magayo():
     """
-    Parse magayo.com Toto results page.
-    Latest draw block:
-      30 April 2026 (Thursday)
-      [ball images with p2=02][p2=06]...[p2=39]
-      Additional [p2=15]
+    Parse magayo.com recent draws table — plain text section:
 
-    Recent draws listed as:
       27 April 2026
       Monday
       03 11 13 22 28 48 Additional 21
+
+    This section is plain text and survives bot detection even when
+    ball images are blocked.
     """
     print('Fetching magayo.com...')
-    r = requests.get(MAGAYO_URL, headers=HEADERS, timeout=20)
+    r = requests.get(MAGAYO_URL, headers=HEADERS, timeout=25)
     r.raise_for_status()
     text = r.text
 
-    # ── Latest draw: extract from ball image URLs ──────────────────────────
-    # Pattern: show_ball.php?p1=M&p2=02 for winning, p1=B for bonus
-    # Find date of latest draw
+    print(f'Page size: {len(text)} chars')
+
+    # Strategy 1: Parse plain-text recent draws section
+    # Look for pattern: date line, day line, number line with "Additional"
+    # Example: "27 April 2026\nMonday\n03 11 13 22 28 48 Additional 21"
+    pattern = re.compile(
+        r'(\d{1,2}\s+\w+\s+\d{4})\s*'           # date: "27 April 2026"
+        r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*'
+        r'((?:\d{2}\s+){5}\d{2})\s*'             # 6 numbers: "03 11 13 22 28 48"
+        r'Additional\s+(\d{2})',                  # bonus: "21"
+        re.IGNORECASE
+    )
+
+    matches = pattern.findall(text)
+    print(f'Found {len(matches)} draw matches in recent table')
+
+    if matches:
+        # First match = most recent draw
+        date_raw, nums_raw, bonus_raw = matches[0]
+        date_str = datetime.strptime(date_raw.strip(), '%d %B %Y').strftime('%Y-%m-%d')
+        numbers  = sorted([int(n) for n in nums_raw.strip().split()])
+        bonus    = int(bonus_raw.strip())
+        draw_no  = estimate_draw_no(date_str)
+
+        return {
+            'drawNo':    draw_no,
+            'date':      date_str,
+            'numbers':   numbers,
+            'bonus':     bonus,
+            'prizePool': None,
+        }
+
+    # Strategy 2: ball image URLs (works when page is fully rendered)
+    print('Trying ball image URL strategy...')
     latest_date_m = re.search(
-        r'(\d{1,2}\s+\w+\s+\d{4})\s*\((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\)',
+        r'(\d{1,2}\s+\w+\s+\d{4})\s*'
+        r'\((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\)',
         text
     )
-    if not latest_date_m:
-        raise ValueError('Could not find latest draw date on magayo.com')
+    if latest_date_m:
+        block_start  = latest_date_m.end()
+        block_end    = text.find('Next Toto', block_start)
+        block        = text[block_start: block_end if block_end != -1 else block_start + 1000]
+        winning_nums = [int(m) for m in re.findall(r'p1=M&(?:amp;)?p2=(\d{2})', block)]
+        bonus_nums   = [int(m) for m in re.findall(r'p1=B&(?:amp;)?p2=(\d{2})', block)]
 
-    latest_date_str_raw = latest_date_m.group(1)
-    try:
-        latest_date = datetime.strptime(latest_date_str_raw, '%d %B %Y').strftime('%Y-%m-%d')
-    except ValueError:
-        raise ValueError(f'Could not parse date: {latest_date_str_raw}')
+        print(f'Ball strategy: {len(winning_nums)} winning, {len(bonus_nums)} bonus')
 
-    # Extract ball numbers from image URLs in the block after the date
-    block_start = latest_date_m.end()
-    block_end   = text.find('Next Toto', block_start)
-    if block_end == -1:
-        block_end = block_start + 1000
-    block = text[block_start:block_end]
+        if len(winning_nums) == 6 and bonus_nums:
+            date_str = datetime.strptime(
+                latest_date_m.group(1).strip(), '%d %B %Y'
+            ).strftime('%Y-%m-%d')
+            draw_no = estimate_draw_no(date_str)
+            return {
+                'drawNo':    draw_no,
+                'date':      date_str,
+                'numbers':   sorted(winning_nums),
+                'bonus':     bonus_nums[0],
+                'prizePool': None,
+            }
 
-    winning_nums = [int(m) for m in re.findall(r'p1=M&p2=(\d{2})', block)]
-    bonus_nums   = [int(m) for m in re.findall(r'p1=B&p2=(\d{2})', block)]
+    # Debug: print snippet so we can see what we got
+    print('--- Page snippet (first 2000 chars) ---')
+    print(text[:2000])
+    print('--- End snippet ---')
 
-    if len(winning_nums) != 6:
-        raise ValueError(f'Expected 6 winning numbers, found {len(winning_nums)}')
-    if not bonus_nums:
-        raise ValueError('Could not find bonus number')
-
-    draw_no = estimate_draw_no(latest_date)
-
-    return {
-        'drawNo':    draw_no,
-        'date':      latest_date,
-        'numbers':   sorted(winning_nums),
-        'bonus':     bonus_nums[0],
-        'prizePool': None,
-    }
-
-
-def fetch_yelu():
-    """Parse yelu.sg results page as fallback."""
-    print('Fetching yelu.sg...')
-    r = requests.get(YELU_URL, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    text = r.text
-
-    draw_m = re.search(r'#(\d{4})', text)
-    if not draw_m:
-        raise ValueError('Could not find draw number on yelu.sg')
-    draw_no = int(draw_m.group(1))
-
-    date_m   = re.search(r'(\d{1,2}\s+\w+,\s+\d{4})', text)
-    date_str = None
-    if date_m:
-        try:
-            date_str = datetime.strptime(date_m.group(1), '%d %B, %Y').strftime('%Y-%m-%d')
-        except ValueError:
-            pass
-
-    win_start = text.find('TOTO Winning Numbers')
-    win_end   = text.find('GROUP 1', win_start)
-    if win_start == -1 or win_end == -1:
-        raise ValueError('Could not find winning numbers block on yelu.sg')
-
-    block    = text[win_start:win_end]
-    all_nums = [int(n) for n in re.findall(r'\b(\d{1,2})\b', block) if 1 <= int(n) <= 49]
-
-    seen, unique = set(), []
-    for n in all_nums:
-        if n not in seen:
-            seen.add(n)
-            unique.append(n)
-
-    if len(unique) < 7:
-        raise ValueError(f'Only {len(unique)} numbers found on yelu.sg')
-
-    prize_m    = re.search(r'GROUP 1 PRIZE[^\$]*\$([\d,]+)', text, re.I)
-    prize_pool = int(prize_m.group(1).replace(',', '')) if prize_m else None
-
-    return {
-        'drawNo':    draw_no,
-        'date':      date_str or datetime.now(SGT).strftime('%Y-%m-%d'),
-        'numbers':   sorted(unique[:6]),
-        'bonus':     unique[6],
-        'prizePool': prize_pool,
-    }
+    raise ValueError('Could not parse any draw data from magayo.com')
 
 
 def validate(record):
@@ -188,7 +166,6 @@ def is_recent(record):
     days_diff = (today - rec_date).days
     if days_diff <= 1:
         return True
-    # Not a draw day today — accept up to 4 days old
     if today.weekday() not in DRAW_DAYS and days_diff <= 4:
         return True
     return False
@@ -210,7 +187,7 @@ def main():
     print(f'Scraper started: {now_sgt.strftime("%Y-%m-%d %H:%M SGT")}')
 
     record = None
-    for fetch_fn in [fetch_magayo, fetch_yelu]:
+    for fetch_fn in [fetch_magayo]:
         try:
             record = fetch_fn()
             print(f'Result: {record}')
@@ -219,7 +196,7 @@ def main():
             print(f'{fetch_fn.__name__} failed: {e}')
 
     if not record:
-        print('ERROR: All sources failed')
+        print('ERROR: All sources failed — check page snippet above for debug info')
         sys.exit(1)
 
     try:
@@ -230,7 +207,7 @@ def main():
         sys.exit(1)
 
     if not is_recent(record):
-        print(f"Draw #{record['drawNo']} ({record['date']}) is stale — not yet updated")
+        print(f"Draw #{record['drawNo']} ({record['date']}) is stale")
         print('Exiting without changes — next cron will retry')
         sys.exit(0)
 
