@@ -1,0 +1,38 @@
+name: Scrape Toto Results
+
+on:
+  schedule:
+    # 11:00 UTC = 19:00 SGT (Mon + Thu, 30 min after 6:30 PM draw)
+    - cron: '0 11 * * 1,4'
+    # 13:45 UTC = 21:45 SGT (Mon + Thu, 15 min after 9:30 PM cascade draw)
+    - cron: '45 13 * * 1,4'
+  workflow_dispatch:   # Manual trigger from GitHub Actions UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: Run scraper
+        run: python scraper.py
+
+      - name: Commit updated draws.json
+        run: |
+          git config user.name  "totolab-bot"
+          git config user.email "bot@totolab.sg"
+          git add draws.json
+          git diff --staged --quiet || git commit -m "Add draw $(python -c "import json; d=json.load(open('draws.json')); print(str(d[0]['drawNo'])+' ('+d[0]['date']+')')")"
+          git push
