@@ -1,10 +1,19 @@
 """
-TotoLab draw scraper — runs as GitHub Action
-Sources (in priority order):
-  1. magayo.com  — parses plain-text recent draws table (robust to bot detection)
-  2. Manual entry fallback with clear instructions
+TotoLab draw scraper — runs as a GitHub Action.
+
+Source: magayo.com (Singapore Pools is JS-rendered + Cloudflare; never scrape it).
+
+Each run:
+  1. Reads the latest draw (ball-image section) AND the ~30-draw recent list
+     (plain text once HTML tags are stripped).
+  2. Inserts every draw missing from draws.json — so a skipped cron, a
+     Friday cascade draw or a slow source never leaves a permanent gap.
+  3. Assigns draw numbers from draws already in the file (magayo shows no
+     draw numbers), and refuses to write if that mapping disagrees with
+     any existing entry.
 """
 
+import html
 import json
 import re
 import sys
@@ -15,7 +24,7 @@ import requests
 
 DRAWS_FILE = Path('draws.json')
 SGT        = timezone(timedelta(hours=8))
-DRAW_DAYS  = {0, 3}  # Monday=0, Thursday=3
+DRAW_DAYS  = {0, 3}  # Mon, Thu — only used by the last-resort estimator
 
 MAGAYO_URL = 'https://www.magayo.com/lotto/singapore/toto-results/'
 
@@ -31,128 +40,131 @@ HEADERS = {
     'Cache-Control': 'no-cache',
 }
 
-# Known draw anchors — update this list periodically
-KNOWN_DRAWS = {
-    '2026-04-30': 4178,
-    '2026-04-27': 4177,
-    '2026-04-23': 4176,
-    '2026-04-20': 4175,
-    '2026-04-16': 4174,
-    '2026-04-13': 4173,
-    '2026-04-09': 4172,
-    '2026-04-06': 4171,
-    '2026-04-02': 4170,
-    '2026-03-30': 4169,
-}
+WEEKDAYS = r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)'
 
+# Last-resort anchor, used only if draws.json shares no date with magayo
 ANCHOR_NO   = 4178
 ANCHOR_DATE = datetime(2026, 4, 30, tzinfo=SGT).date()
 
 
+# ── Parsing ──────────────────────────────────────────────────────────────
+
+def to_iso(date_raw):
+    return datetime.strptime(date_raw.strip(), '%d %B %Y').strftime('%Y-%m-%d')
+
+
+def parse_recent_list(raw_html):
+    """'5 October 2026  Monday  03 13 20 30 48 49 Additional 23' — after tag strip."""
+    text = html.unescape(re.sub(r'<[^>]+>', ' ', raw_html))
+    pattern = re.compile(
+        r'(\d{1,2}\s+[A-Za-z]+\s+\d{4})\s+' + WEEKDAYS + r'\s+'
+        r'((?:\d{1,2}\s+){5}\d{1,2})\s+Additional\s+(\d{1,2})',
+        re.IGNORECASE,
+    )
+    out = []
+    for date_raw, nums_raw, bonus_raw in pattern.findall(text):
+        try:
+            out.append({
+                'date':    to_iso(date_raw),
+                'numbers': sorted(int(n) for n in nums_raw.split()),
+                'bonus':   int(bonus_raw),
+            })
+        except ValueError:
+            continue
+    return out
+
+
+def parse_latest(raw_html):
+    """Latest-result block: '8 October 2026 (Thursday)' followed by ball images."""
+    m = re.search(r'(\d{1,2}\s+[A-Za-z]+\s+\d{4})\s*\(' + WEEKDAYS + r'\)', raw_html)
+    if not m:
+        return None
+    end   = raw_html.find('Next Toto', m.end())
+    block = raw_html[m.end(): end if end != -1 else m.end() + 1500]
+    main  = [int(x) for x in re.findall(r'p1=M&(?:amp;)?p2=(\d{1,2})', block)]
+    bonus = [int(x) for x in re.findall(r'p1=B&(?:amp;)?p2=(\d{1,2})', block)]
+    print(f'Latest block: {len(main)} winning, {len(bonus)} bonus')
+    if len(main) != 6 or not bonus:
+        return None
+    return {'date': to_iso(m.group(1)), 'numbers': sorted(main), 'bonus': bonus[0]}
+
+
+def fetch_magayo():
+    print('Fetching magayo.com...')
+    r = requests.get(MAGAYO_URL, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    raw = r.text
+    print(f'Page size: {len(raw)} chars')
+
+    by_date = {}
+    for rec in parse_recent_list(raw):
+        by_date.setdefault(rec['date'], rec)
+    print(f'Recent list: {len(by_date)} draws')
+
+    latest = parse_latest(raw)
+    if latest:
+        by_date[latest['date']] = latest
+        print(f"Latest: {latest['date']}")
+
+    if not by_date:
+        print('--- Page snippet (first 2000 chars) ---')
+        print(raw[:2000])
+        print('--- End snippet ---')
+        raise ValueError('Could not parse any draw data from magayo.com')
+
+    # Oldest → newest
+    return sorted(by_date.values(), key=lambda r: r['date'])
+
+
+# ── Draw numbering ───────────────────────────────────────────────────────
+
 def estimate_draw_no(date_str):
-    if date_str in KNOWN_DRAWS:
-        return KNOWN_DRAWS[date_str]
+    """Counts Mon/Thu from the anchor. Wrong across irregular draws — fallback only."""
     target = datetime.strptime(date_str, '%Y-%m-%d').date()
     delta  = (target - ANCHOR_DATE).days
-    count  = 0
     step   = 1 if delta > 0 else -1
+    count  = 0
     for i in range(abs(delta)):
-        d = ANCHOR_DATE + timedelta(days=(i + 1) * step)
-        if d.weekday() in DRAW_DAYS:
+        if (ANCHOR_DATE + timedelta(days=(i + 1) * step)).weekday() in DRAW_DAYS:
             count += step
     return ANCHOR_NO + count
 
 
-def fetch_magayo():
+def assign_draw_numbers(scraped, existing):
     """
-    Parse magayo.com recent draws table — plain text section:
-
-      27 April 2026
-      Monday
-      03 11 13 22 28 48 Additional 21
-
-    This section is plain text and survives bot detection even when
-    ball images are blocked.
+    magayo lists consecutive draws, so draw numbers follow list position.
+    Anchor on the newest date present in both lists, then verify every
+    other overlapping date maps to the same number already on file.
     """
-    print('Fetching magayo.com...')
-    r = requests.get(MAGAYO_URL, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    text = r.text
+    known = {d['date']: d['drawNo'] for d in existing}
+    dates = [r['date'] for r in scraped]
+    shared = [i for i, d in enumerate(dates) if d in known]
 
-    print(f'Page size: {len(text)} chars')
+    if shared:
+        a = shared[-1]
+        base = known[dates[a]] - a
+        for i in shared:
+            if known[dates[i]] != base + i:
+                raise ValueError(
+                    f'Numbering mismatch on {dates[i]}: file has #{known[dates[i]]}, '
+                    f'list position implies #{base + i}. magayo list may have a hole — '
+                    f'not writing.'
+                )
+        for i, rec in enumerate(scraped):
+            rec['drawNo'] = base + i
+        print(f'Numbered from anchor {dates[a]} = #{known[dates[a]]}')
+    else:
+        print('WARNING: no overlap with draws.json — using weekday estimator')
+        for rec in scraped:
+            rec['drawNo'] = estimate_draw_no(rec['date'])
 
-    # Strategy 1: Parse plain-text recent draws section
-    # Look for pattern: date line, day line, number line with "Additional"
-    # Example: "27 April 2026\nMonday\n03 11 13 22 28 48 Additional 21"
-    pattern = re.compile(
-        r'(\d{1,2}\s+\w+\s+\d{4})\s*'           # date: "27 April 2026"
-        r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*'
-        r'((?:\d{2}\s+){5}\d{2})\s*'             # 6 numbers: "03 11 13 22 28 48"
-        r'Additional\s+(\d{2})',                  # bonus: "21"
-        re.IGNORECASE
-    )
 
-    matches = pattern.findall(text)
-    print(f'Found {len(matches)} draw matches in recent table')
-
-    if matches:
-        # First match = most recent draw
-        date_raw, nums_raw, bonus_raw = matches[0]
-        date_str = datetime.strptime(date_raw.strip(), '%d %B %Y').strftime('%Y-%m-%d')
-        numbers  = sorted([int(n) for n in nums_raw.strip().split()])
-        bonus    = int(bonus_raw.strip())
-        draw_no  = estimate_draw_no(date_str)
-
-        return {
-            'drawNo':    draw_no,
-            'date':      date_str,
-            'numbers':   numbers,
-            'bonus':     bonus,
-            'prizePool': None,
-        }
-
-    # Strategy 2: ball image URLs (works when page is fully rendered)
-    print('Trying ball image URL strategy...')
-    latest_date_m = re.search(
-        r'(\d{1,2}\s+\w+\s+\d{4})\s*'
-        r'\((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\)',
-        text
-    )
-    if latest_date_m:
-        block_start  = latest_date_m.end()
-        block_end    = text.find('Next Toto', block_start)
-        block        = text[block_start: block_end if block_end != -1 else block_start + 1000]
-        winning_nums = [int(m) for m in re.findall(r'p1=M&(?:amp;)?p2=(\d{2})', block)]
-        bonus_nums   = [int(m) for m in re.findall(r'p1=B&(?:amp;)?p2=(\d{2})', block)]
-
-        print(f'Ball strategy: {len(winning_nums)} winning, {len(bonus_nums)} bonus')
-
-        if len(winning_nums) == 6 and bonus_nums:
-            date_str = datetime.strptime(
-                latest_date_m.group(1).strip(), '%d %B %Y'
-            ).strftime('%Y-%m-%d')
-            draw_no = estimate_draw_no(date_str)
-            return {
-                'drawNo':    draw_no,
-                'date':      date_str,
-                'numbers':   sorted(winning_nums),
-                'bonus':     bonus_nums[0],
-                'prizePool': None,
-            }
-
-    # Debug: print snippet so we can see what we got
-    print('--- Page snippet (first 2000 chars) ---')
-    print(text[:2000])
-    print('--- End snippet ---')
-
-    raise ValueError('Could not parse any draw data from magayo.com')
-
+# ── Validation / IO ──────────────────────────────────────────────────────
 
 def validate(record):
-    nums  = record['numbers']
-    bonus = record['bonus']
+    nums, bonus = record['numbers'], record['bonus']
     assert record['drawNo'] > 0,                            f"Invalid drawNo: {record['drawNo']}"
-    assert re.match(r'\d{4}-\d{2}-\d{2}', record['date']), f"Invalid date: {record['date']}"
+    assert re.match(r'\d{4}-\d{2}-\d{2}$', record['date']), f"Invalid date: {record['date']}"
     assert len(nums) == 6,                                  f"Expected 6 numbers, got {len(nums)}"
     assert len(set(nums)) == 6,                             f"Duplicate numbers: {nums}"
     assert all(1 <= n <= 49 for n in nums),                 f"Number out of range: {nums}"
@@ -160,21 +172,8 @@ def validate(record):
     assert bonus not in nums,                               f"Bonus {bonus} duplicates winning number"
 
 
-def is_recent(record):
-    today     = datetime.now(SGT).date()
-    rec_date  = datetime.strptime(record['date'], '%Y-%m-%d').date()
-    days_diff = (today - rec_date).days
-    if days_diff <= 1:
-        return True
-    if today.weekday() not in DRAW_DAYS and days_diff <= 4:
-        return True
-    return False
-
-
 def load_draws():
-    if DRAWS_FILE.exists():
-        return json.loads(DRAWS_FILE.read_text())
-    return []
+    return json.loads(DRAWS_FILE.read_text()) if DRAWS_FILE.exists() else []
 
 
 def save_draws(draws):
@@ -182,42 +181,61 @@ def save_draws(draws):
     print(f'Saved {len(draws)} draws to {DRAWS_FILE}')
 
 
+def find_gaps(draws):
+    nos = {d['drawNo'] for d in draws}
+    return sorted(set(range(min(nos), max(nos) + 1)) - nos) if nos else []
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
 def main():
-    now_sgt = datetime.now(SGT)
-    print(f'Scraper started: {now_sgt.strftime("%Y-%m-%d %H:%M SGT")}')
-
-    record = None
-    for fetch_fn in [fetch_magayo]:
-        try:
-            record = fetch_fn()
-            print(f'Result: {record}')
-            break
-        except Exception as e:
-            print(f'{fetch_fn.__name__} failed: {e}')
-
-    if not record:
-        print('ERROR: All sources failed — check page snippet above for debug info')
-        sys.exit(1)
+    print(f'Scraper started: {datetime.now(SGT):%Y-%m-%d %H:%M} SGT')
 
     try:
-        validate(record)
-        print('Validation passed')
-    except AssertionError as e:
-        print(f'ERROR: Validation failed — {e}')
+        scraped = fetch_magayo()
+    except Exception as e:
+        print(f'ERROR: fetch failed — {e}')
         sys.exit(1)
 
-    if not is_recent(record):
-        print(f"Draw #{record['drawNo']} ({record['date']}) is stale")
-        print('Exiting without changes — next cron will retry')
-        sys.exit(0)
-
     existing = load_draws()
-    if existing and existing[0]['drawNo'] == record['drawNo']:
-        print(f"Draw #{record['drawNo']} already recorded — no change needed")
+    try:
+        assign_draw_numbers(scraped, existing)
+    except ValueError as e:
+        print(f'ERROR: {e}')
+        sys.exit(1)
+
+    by_no = {d['drawNo']: d for d in existing}
+    added = []
+    for rec in scraped:
+        try:
+            validate(rec)
+        except AssertionError as e:
+            print(f"Skipping {rec['date']}: {e}")
+            continue
+        current = by_no.get(rec['drawNo'])
+        if current:
+            if (current['numbers'], current['bonus']) != (rec['numbers'], rec['bonus']):
+                print(f"WARNING: #{rec['drawNo']} differs from magayo — file kept. "
+                      f"file={current['numbers']}+{current['bonus']} "
+                      f"magayo={rec['numbers']}+{rec['bonus']}")
+            continue
+        by_no[rec['drawNo']] = {
+            'drawNo': rec['drawNo'], 'date': rec['date'],
+            'numbers': rec['numbers'], 'bonus': rec['bonus'], 'prizePool': None,
+        }
+        added.append(rec['drawNo'])
+
+    merged = sorted(by_no.values(), key=lambda d: -d['drawNo'])
+    gaps = find_gaps(merged)
+    if gaps:
+        print(f'NOTE: gaps older than magayo\'s window remain: {gaps}')
+
+    if not added:
+        print(f"No new draws. Latest on file: #{merged[0]['drawNo']} ({merged[0]['date']})")
         sys.exit(0)
 
-    save_draws([record] + existing)
-    print(f"Successfully recorded draw #{record['drawNo']} ({record['date']})")
+    save_draws(merged)
+    print(f'Added draws: {sorted(added)}')
 
 
 if __name__ == '__main__':

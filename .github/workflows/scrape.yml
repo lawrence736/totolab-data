@@ -1,12 +1,19 @@
 name: Scrape Toto Results
 
+# All times SGT (UTC+8). Off-the-hour minutes avoid GitHub's :00 congestion.
+# The scraper backfills anything missing from magayo's last ~30 draws,
+# so extra runs are harmless and any single skipped run self-heals.
 on:
   schedule:
-    # 11:00 UTC = 19:00 SGT (Mon + Thu, 30 min after 6:30 PM draw)
-    - cron: '0 11 * * 1,4'
-    # 13:45 UTC = 21:45 SGT (Mon + Thu, 15 min after 9:30 PM cascade draw)
-    - cron: '45 13 * * 1,4'
-  workflow_dispatch:   # Manual trigger from GitHub Actions UI
+    - cron: '15 11 * * 1,4'     # 19:15 Mon/Thu — after 6:30 PM regular draw
+    - cron: '5 14 * * 1,4,5'    # 22:05 Mon/Thu/Fri — after 9:30 PM cascade draw
+    - cron: '40 15 * * 1,4,5'   # 23:40 Mon/Thu/Fri — late-source safety net
+    - cron: '10 1 * * *'        # 09:10 daily — catch-all
+  workflow_dispatch:            # Manual trigger from GitHub Actions UI
+
+concurrency:
+  group: scrape
+  cancel-in-progress: false
 
 jobs:
   scrape:
@@ -24,15 +31,25 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 lxml
+        run: pip install requests
 
       - name: Run scraper
         run: python scraper.py
 
       - name: Commit updated draws.json
+        id: commit
         run: |
           git config user.name  "totolab-bot"
           git config user.email "bot@totolab.sg"
           git add draws.json
-          git diff --staged --quiet || git commit -m "Add draw $(python -c "import json; d=json.load(open('draws.json')); print(str(d[0]['drawNo'])+' ('+d[0]['date']+')')")"
-          git push
+          if git diff --staged --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "Add draw $(python -c "import json; d=json.load(open('draws.json')); print(str(d[0]['drawNo'])+' ('+d[0]['date']+')')")"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Purge jsDelivr cache
+        if: steps.commit.outputs.changed == 'true'
+        run: curl -fsS "https://purge.jsdelivr.net/gh/lawrence736/totolab-data@main/draws.json"
