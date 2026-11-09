@@ -89,12 +89,56 @@ def parse_latest(raw_html):
     return {'date': to_iso(m.group(1)), 'numbers': sorted(main), 'bonus': bonus[0]}
 
 
+# ── Next jackpot → next_draw.json (read by the site's countdown) ─────────
+NEXT_FILE = Path(__file__).parent / 'next_draw.json'
+CASCADE_MIN = 10_000_000   # jackpots this big are run as 9:30 PM draws (cascade / big-jackpot)
+
+def parse_next_jackpot(raw_html):
+    """magayo shows 'Next Toto Jackpot' followed by the date and an estimated amount."""
+    text = re.sub(r'<[^>]+>', ' ', raw_html)
+    text = re.sub(r'\s+', ' ', text)
+    m = re.search(r'Next Toto Jackpot\s+(\d{1,2} [A-Za-z]+ \d{4})\s*\([A-Za-z]+\)\s*\$([\d,]+)', text)
+    if not m:
+        return None
+    return {'date': to_iso(m.group(1)), 'jackpot': int(m.group(2).replace(',', ''))}
+
+def update_next_draw(raw_html):
+    """Keep manual entries; replace the automatic one. Never fails the run."""
+    try:
+        nxt = parse_next_jackpot(raw_html)
+        today = datetime.now(SGT).date().isoformat()
+        cur = json.loads(NEXT_FILE.read_text()) if NEXT_FILE.exists() else []
+        keep = [e for e in cur if e.get('date', '') >= today and not e.get('auto')]
+        if nxt and nxt['date'] >= today:
+            j = nxt['jackpot']; m = j / 1e6
+            amt = f'S${m:.0f}M' if m >= 10 else f'S${m:.1f}M'
+            manual = next((e for e in keep if e['date'] == nxt['date']), None)
+            if manual:
+                manual['jackpot'] = j
+            else:
+                big = j >= CASCADE_MIN
+                keep.append({'date': nxt['date'], 'time': '21:30' if big else '18:30', 'jackpot': j, 'auto': True,
+                             'label': f'{amt} jackpot (est.)' + (' · big-jackpot draw' if big else ''),
+                             **({'chip': '9:30pm draw', 'link': '/toto-snowball-cascade-draws.html'} if big else {})})
+            print(f"Next jackpot: {nxt['date']} ${j:,}")
+        else:
+            print('Next jackpot: not found on page')
+        keep.sort(key=lambda e: e['date'])
+        new = json.dumps(keep, indent=2, ensure_ascii=False) + '\n'
+        if not NEXT_FILE.exists() or NEXT_FILE.read_text() != new:
+            NEXT_FILE.write_text(new)
+            print('next_draw.json updated')
+    except Exception as e:
+        print(f'WARNING: next_draw update skipped — {e}')
+
+
 def fetch_magayo():
     print('Fetching magayo.com...')
     r = requests.get(MAGAYO_URL, headers=HEADERS, timeout=25)
     r.raise_for_status()
     raw = r.text
     print(f'Page size: {len(raw)} chars')
+    update_next_draw(raw)
 
     by_date = {}
     for rec in parse_recent_list(raw):
