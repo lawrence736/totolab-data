@@ -1,1 +1,9 @@
-[]
+[
+  {
+    "date": "2026-11-12",
+    "time": "18:30",
+    "jackpot": 1000000,
+    "auto": true,
+    "label": "S$1.0M jackpot (est.)"
+  }
+]
